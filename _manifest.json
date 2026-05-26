@@ -1,0 +1,37 @@
+{
+  "manifest_version": 2,
+  "id": "Emilia-awa.maibot-moepix",
+  "version": "1.0.0",
+  "name": "二次元图片插件",
+  "description": "基于 Lolicon API 的二次元图片获取插件，支持 AI 智能调用和命令直接调用，内容级别采用白名单控制",
+  "author": {
+    "name": "MaiBot",
+    "url": "https://github.com/Emilia-awa/maibot-moepix"
+  },
+  "license": "WTFPL",
+  "urls": {
+    "repository": "https://github.com/Emilia-awa/maibot-moepix",
+    "homepage": "https://github.com/Emilia-awa/maibot-moepix"
+  },
+  "host_application": {
+    "min_version": "1.0.0",
+    "max_version": "1.99.99"
+  },
+  "sdk": {
+    "min_version": "2.0.0",
+    "max_version": "2.99.99"
+  },
+  "dependencies": [],
+  "capabilities": [
+    "send.text",
+    "send.image",
+    "config.get",
+    "config.get_plugin",
+    "api.call"
+  ],
+  "i18n": {
+    "default_locale": "zh-CN",
+    "locales_path": "_locales",
+    "supported_locales": ["zh-CN"]
+  }
+}

@@ -1,0 +1,34 @@
+{
+  "plugin_name": "美图插件",
+  "plugin_description": "基于 Lolicon API 的智能美图获取插件，支持 AI 智能调用和命令直接调用",
+
+  "tool.get_setu.name": "获取美图",
+  "tool.get_setu.description": "获取二次元美图，可指定标签、数量和是否R18",
+  "tool.get_setu.param.tags": "标签列表",
+  "tool.get_setu.param.num": "请求图片数量",
+  "tool.get_setu.param.r18": "是否请求 扩展 内容",
+
+  "tool.enable_r18.name": "开启扩展权限",
+  "tool.enable_r18.description": "为指定会话开启 扩展 美图权限",
+  "tool.enable_r18.param.chat_id": "会话标识",
+  "tool.enable_r18.param.reason": "开启原因",
+
+  "tool.disable_r18.name": "关闭扩展权限",
+  "tool.disable_r18.description": "关闭指定会话的 扩展 美图权限",
+  "tool.disable_r18.param.chat_id": "会话标识",
+  "tool.disable_r18.param.reason": "关闭原因",
+
+  "command.setu.name": "美图命令",
+  "command.setu.description": "通过 /tu 命令获取美图",
+
+  "r18.not_allowed": "🔒 当前会话未开启 扩展 权限，无法请求 扩展 内容。",
+  "r18.enabled": "✅ 扩展 美图权限已开启。",
+  "r18.disabled": "🔒 扩展 美图权限已关闭。",
+  "r18.already_enabled": "当前会话已拥有 扩展 权限，无需重复开启。",
+  "r18.already_disabled": "当前会话本身就没有 扩展 权限，无需关闭。",
+
+  "rate_limit.exceeded": "⏰ 请求过于频繁，请稍后再试~",
+  "search.loading": "🔍 正在搜索图片，请稍候...",
+  "search.failed": "❌ 获取图片失败",
+  "search.no_result": "没有找到符合条件的图片，换个关键词试试？"
+}
