@@ -5,7 +5,7 @@
   "name": "maibot moepix",
   "description": "基于 Lolicon API 的二次元图片获取插件，支持 AI 智能调用和命令直接调用，并采取一系列防风控手段，内容级别采用白名单控制",
   "author": {
-    "name": "MaiBot",
+    "name": "Emilia-awa",
     "url": "https://github.com/Emilia-awa/maibot-moepix"
   },
   "license": "WTFPL",
