@@ -383,20 +383,28 @@ class SetuPlugin(MaiBotPlugin):
 
             # 链接模式：直接发送图片链接文本
             if send_mode in ("link", "链接"):
-                link_text = r18_flag + title + " - " + author + "\n" + image_url
+                link_text = title + " - " + author + "\n" + image_url
                 try:
-                    await self.ctx.send.text(link_text, stream_id)
+                    msg_id = await self._send_text_via_api(link_text, stream_id, group_id, user_id)
                     sent_count += 1
+                    recall_sec = self.config.limits.recall_after_seconds
+                    if recall_sec > 0 and msg_id:
+                        asyncio.create_task(self._schedule_recall(stream_id, recall_sec, msg_id))
+                        self.ctx.logger.info("[SetuPlugin] 链接已计划撤回 message_id=%s 延迟%ds", msg_id, recall_sec)
                 except Exception as e:
                     info_lines.append("• " + r18_flag + title + " - 发送链接失败: " + str(e))
                 continue
 
             # kz_link 模式：全年龄发图片，扩展内容发链接
             if send_mode == "kz_link" and is_r18_item:
-                link_text = r18_flag + title + " - " + author + "\n" + image_url
+                link_text = title + " - " + author + "\n" + image_url
                 try:
-                    await self.ctx.send.text(link_text, stream_id)
+                    msg_id = await self._send_text_via_api(link_text, stream_id, group_id, user_id)
                     sent_count += 1
+                    recall_sec = self.config.limits.recall_after_seconds
+                    if recall_sec > 0 and msg_id:
+                        asyncio.create_task(self._schedule_recall(stream_id, recall_sec, msg_id))
+                        self.ctx.logger.info("[SetuPlugin] 链接已计划撤回 message_id=%s 延迟%ds", msg_id, recall_sec)
                 except Exception as e:
                     info_lines.append("• " + r18_flag + title + " - 发送链接失败: " + str(e))
                 continue
@@ -407,8 +415,11 @@ class SetuPlugin(MaiBotPlugin):
                 # 图片下载失败时回退到发链接
                 if send_mode in ("both", "两者"):
                     try:
-                        await self.ctx.send.text(r18_flag + title + " - " + author + "\n" + image_url, stream_id)
+                        msg_id = await self._send_text_via_api(title + " - " + author + "\n" + image_url, stream_id, group_id, user_id)
                         sent_count += 1
+                        recall_sec = self.config.limits.recall_after_seconds
+                        if recall_sec > 0 and msg_id:
+                            asyncio.create_task(self._schedule_recall(stream_id, recall_sec, msg_id))
                     except Exception as e:
                         info_lines.append("• " + r18_flag + title + " - 发送失败: " + str(e))
                 else:
@@ -428,7 +439,10 @@ class SetuPlugin(MaiBotPlugin):
             # both 模式下同时发送链接
             if send_mode in ("both", "两者"):
                 try:
-                    await self.ctx.send.text(r18_flag + title + " - " + author + "\n" + image_url, stream_id)
+                    link_msg_id = await self._send_text_via_api(title + " - " + author + "\n" + image_url, stream_id, group_id, user_id)
+                    recall_sec = self.config.limits.recall_after_seconds
+                    if recall_sec > 0 and link_msg_id:
+                        asyncio.create_task(self._schedule_recall(stream_id, recall_sec, link_msg_id))
                 except Exception:
                     pass
 
@@ -481,6 +495,54 @@ class SetuPlugin(MaiBotPlugin):
         except Exception as e:
             self.ctx.logger.error("[SetuPlugin] send_msg API 调用失败: %s，回退到 ctx.send.image", e)
             await self.ctx.send.image(b64_data, stream_id)
+            return None
+
+    async def _send_text_via_api(self, text, stream_id, group_id="", user_id=""):
+        """通过 NapCat send_msg API 发送文本消息，返回 message_id"""
+        text_segment = {
+            "type": "text",
+            "data": {
+                "text": text
+            }
+        }
+        # 确定发送目标
+        if group_id:
+            send_params = {
+                "message_type": "group",
+                "group_id": int(group_id) if str(group_id).isdigit() else group_id,
+                "message": [text_segment],
+            }
+        elif user_id:
+            send_params = {
+                "message_type": "private",
+                "user_id": int(user_id) if str(user_id).isdigit() else user_id,
+                "message": [text_segment],
+            }
+        else:
+            # 回退：使用 ctx.send.text
+            await self.ctx.send.text(text, stream_id)
+            return None
+
+        try:
+            result = await self.ctx.api.call(
+                "adapter.napcat.message.send_msg",
+                version="1",
+                params=send_params,
+            )
+            self.ctx.logger.info("[SetuPlugin] send_text API 返回: %s", result)
+            # 提取 message_id
+            if isinstance(result, dict):
+                msg_id = result.get("message_id")
+                if not msg_id and isinstance(result.get("data"), dict):
+                    msg_id = result["data"].get("message_id")
+                if not msg_id:
+                    msg_id = result.get("external_message_id")
+                self.ctx.logger.info("[SetuPlugin] 文本提取到 message_id=%s", msg_id)
+                return msg_id
+            return None
+        except Exception as e:
+            self.ctx.logger.error("[SetuPlugin] send_text API 调用失败: %s，回退到 ctx.send.text", e)
+            await self.ctx.send.text(text, stream_id)
             return None
 
     async def _schedule_recall(self, stream_id, seconds, message_id=None):
