@@ -482,7 +482,10 @@ class SetuPlugin(MaiBotPlugin):
                 params=send_params,
             )
             self.ctx.logger.info("[SetuPlugin] send_msg API 返回: %s", result)
-            # 提取 message_id — 从 data 嵌套层提取
+            if isinstance(result, dict) and not result.get("success", True):
+                self.ctx.logger.warning("[SetuPlugin] send_msg API 失败，回退到 ctx.send.image")
+                await self.ctx.send.image(b64_data, stream_id)
+                return None
             if isinstance(result, dict):
                 msg_id = result.get("message_id")
                 if not msg_id and isinstance(result.get("data"), dict):
@@ -530,7 +533,10 @@ class SetuPlugin(MaiBotPlugin):
                 params=send_params,
             )
             self.ctx.logger.info("[SetuPlugin] send_text API 返回: %s", result)
-            # 提取 message_id
+            if isinstance(result, dict) and not result.get("success", True):
+                self.ctx.logger.warning("[SetuPlugin] send_text API 失败，回退到 ctx.send.text")
+                await self.ctx.send.text(text, stream_id)
+                return None
             if isinstance(result, dict):
                 msg_id = result.get("message_id")
                 if not msg_id and isinstance(result.get("data"), dict):
