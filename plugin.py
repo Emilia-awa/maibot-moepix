@@ -576,10 +576,13 @@ class SetuPlugin(MaiBotPlugin):
         "get_setu",
         description=(
             "获取二次元图片/美图/涩图。当用户表达想要看图片、二次元图、动漫图、美图、"
-            "色图、涩图等意图时，都可以调用此工具。默认返回全年龄向的二次元图片，"
-            "优先向用户提供全年龄向的次元图片"
-            "仅当用户明确、反复要求 R18/成人/色情内容时，才设置 r18=true。"
-            "不要主动询问用户是否需要 R18，也不要主动检查 R18 权限。"
+            "色图、涩图等意图时，都可以调用此工具。默认返回全年龄向的二次元图片。"
+            "仅当用户明确、反复要求 R18/成人/色情内容时，才设置 r18=true；"
+            "不要仅因为用户说“色图/涩图”就设置 r18=true，也不要主动询问用户是否需要 R18，"
+            "也不要主动检查 R18 权限。"
+            "注意：Lolicon 使用 Pixiv 标签精确匹配，不是自然语言语义搜索。"
+            "调用前必须把用户描述的主题概念转换为 Pixiv 中实际存在的常见标签，"
+            "优先使用日文标签，并补充常见英文、中文同义标签；不要直接照抄用户自然语言。"
         ),
         activation_type=ActivationType.ALWAYS,
         parameters=[
@@ -587,10 +590,24 @@ class SetuPlugin(MaiBotPlugin):
                 name="tags",
                 param_type=ToolParamType.ARRAY,
                 description=(
-                    '标签列表，如 ["白丝","萝莉"]。多个标签间 AND 关系，标签内用 | 分隔表示 OR。'
-                    '重要：只传用户明确指定的二次元标签（如角色名、外貌特征、服装等）。'
-                    '不要传"涩图""色图""图片"等通用词作为标签，这些不是有效的二次元标签。'
-                    '如果用户没有指定具体标签，就不传 tags 参数，让 API 随机返回。'
+                    'Pixiv 标签列表，用于筛选作品。注意：Lolicon 使用 Pixiv 标签精确匹配，'
+                    '不是自然语言语义搜索，请把用户表达的主题转换成 Pixiv 常见标签。'
+                    '规则：'
+                    '1) 同一概念的同义词必须放在同一个字符串内并用 | 分隔表示 OR，'
+                    '例如 "足裏|裸足|feet|足控"；'
+                    '2) 不同概念必须作为不同数组元素，表示 AND，'
+                    '例如 ["白タイツ|白ストッキング|white stockings|白丝", "足裏|裸足|feet|足控"]；'
+                    '3) 优先使用日文 Pixiv 标签，并补充常见英文、中文同义标签；'
+                    '4) 只传用户明确要求的主题概念（角色、服装、外貌、动作等），'
+                    '不得添加用户没有要求的额外概念；'
+                    '5) 内容级别词（R18、成人向等）和“图片/色图/涩图”等泛称不要放入 tags，'
+                    'R18 由独立参数 r18 表达；'
+                    '6) 用户没有指定具体主题时，不要传 tags，让 API 随机返回。'
+                    '正确示例：用户说“来点 R18 玉足”应生成 tags:["足裏|裸足|feet|足控"]、r18:true；'
+                    '用户说“来点白丝玉足”应生成 tags:["白タイツ|白ストッキング|white stockings|白丝",'
+                    '"足裏|裸足|feet|足控"]、r18:false。'
+                    '错误示例：["玉足"]（直接照抄自然语言）、["足裏","裸足","feet"]（被当作 AND）、'
+                    '["R18","玉足"]（R18 不应作为标签）。'
                 ),
                 required=False,
                 items_schema={"type": "string"},
@@ -732,9 +749,24 @@ class SetuPlugin(MaiBotPlugin):
             message = kwargs.get("message", {})
             plain_text = ""
             if isinstance(message, dict):
-                plain_text = message.get("plain_text", "").strip()
+                plain_text = message.get("plain_text", "") or message.get("text", "") or ""
+            elif isinstance(message, str):
+                plain_text = message
+            if not plain_text:
+                plain_text = kwargs.get("plain_text", "") or kwargs.get("text", "") or ""
 
-            args_text = plain_text[3:].strip() if plain_text.startswith("/tu") else ""
+            plain_text = plain_text.strip()
+
+            # 兼容两种事件格式：
+            # 1. plain_text 是完整命令文本，如 "/tu 背景"
+            # 2. 框架已去掉命令前缀，plain_text 只是参数文本，如 "背景"
+            if plain_text.startswith("/tu"):
+                args_text = plain_text[len("/tu"):].strip()
+            elif plain_text.startswith("tu") and (len(plain_text) == 2 or plain_text[2:3].isspace()):
+                args_text = plain_text[2:].strip()
+            else:
+                args_text = plain_text
+
             args = args_text.split() if args_text else []
 
             tags = []
