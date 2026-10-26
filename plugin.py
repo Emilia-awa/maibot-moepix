@@ -28,6 +28,20 @@ from maibot_sdk.types import (
 )
 
 
+# ── 下载参数 ──────────────────────────────────────────────
+# i.pixiv.re 这类 Cloudflare 反代会间歇性长时间无响应（实测单次可卡满 60s），
+# 所以每次只给 25 秒，失败后丢掉旧连接重试，避免一次卡死就整张图丢掉。
+DOWNLOAD_ATTEMPT_TIMEOUT_SEC = 25
+DOWNLOAD_MAX_ATTEMPTS = 3
+# 已知可用的反代兜底；其它反代（i.pixiv.cat / i.yuki.sh）在本机实测不可用。
+FALLBACK_PROXY_HOST = "i.pixiv.re"
+UNUSABLE_PROXY_HOSTS = ("i.pximg.net", "i.pixiv.cat", "i.yuki.sh")
+
+# 工具返回前最多等多久发送结果。宿主对工具调用的 RPC 上限是 60 秒，这里留足余量：
+# 超时不会取消后台发送，只是本次先返回“尚未确认”。
+SEND_REPORT_WAIT_SEC = 45
+
+
 # ── 配置模型 ──────────────────────────────────────────────
 
 
@@ -118,11 +132,15 @@ class SetuPlugin(MaiBotPlugin):
         )
         self._http_session: Optional[aiohttp.ClientSession] = None
         self._plugin_config_path: Optional[str] = None
+        self._pending_send_tasks: set = set()
         self._ensure_config_exists()
         self.ctx.logger.info("[SetuPlugin] 二次元图片插件已加载")
         self.ctx.logger.info("[SetuPlugin] 扩展内容白名单: %s", self.config.r18.allowed_chats)
 
     async def on_unload(self) -> None:
+        for task in list(getattr(self, "_pending_send_tasks", ())):
+            if not task.done():
+                task.cancel()
         if self._http_session and not self._http_session.closed:
             await self._http_session.close()
         self.ctx.logger.info("[SetuPlugin] 二次元图片插件已卸载")
@@ -342,14 +360,32 @@ class SetuPlugin(MaiBotPlugin):
         except Exception as e:
             return {"success": False, "error": "未知错误: " + str(e)}
 
-    async def _download_image_as_base64(self, url):
+    async def _reset_http_session(self) -> None:
+        """丢掉当前连接池，下一次请求会重建会话。
+
+        反代卡死时旧连接可能一直挂在那里，重试必须换新连接才有意义。
+        """
+        session = self._http_session
+        self._http_session = None
+        if session is not None and not session.closed:
+            try:
+                await session.close()
+            except Exception:
+                pass
+
+    async def _download_once(self, url: str) -> Optional[str]:
         try:
             session = await self._get_http_session()
             headers = {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
                 "Referer": "https://www.pixiv.net/",
             }
-            async with session.get(url, headers=headers, ssl=False) as resp:
+            timeout = aiohttp.ClientTimeout(
+                total=DOWNLOAD_ATTEMPT_TIMEOUT_SEC, connect=10
+            )
+            async with session.get(
+                url, headers=headers, ssl=False, timeout=timeout
+            ) as resp:
                 if resp.status != 200:
                     self.ctx.logger.warning("[SetuPlugin] 下载 HTTP %d: %s", resp.status, url)
                     return None
@@ -358,9 +394,53 @@ class SetuPlugin(MaiBotPlugin):
                     self.ctx.logger.warning("[SetuPlugin] 数据过小: %d bytes", len(data))
                     return None
                 return base64.b64encode(data).decode("utf-8")
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
-            self.ctx.logger.error("[SetuPlugin] 下载失败: %s, url=%s", e, url)
+            # asyncio 超时异常的 str() 是空的，这里补上类型名方便排查
+            reason = str(e) or "(无错误信息，通常是超时)"
+            self.ctx.logger.warning(
+                "[SetuPlugin] 下载异常: %s: %s, url=%s",
+                type(e).__name__,
+                reason,
+                url,
+            )
             return None
+
+    async def _download_image_as_base64(self, url):
+        # 候选地址：原地址 + 已知可用反代兜底
+        candidates = [url]
+        fallback_url = url
+        for host in UNUSABLE_PROXY_HOSTS:
+            if host in fallback_url:
+                fallback_url = fallback_url.replace(host, FALLBACK_PROXY_HOST)
+                break
+        if fallback_url != url:
+            candidates.append(fallback_url)
+
+        for attempt in range(1, DOWNLOAD_MAX_ATTEMPTS + 1):
+            target = candidates[min(attempt - 1, len(candidates) - 1)]
+            data = await self._download_once(target)
+            if data:
+                if attempt > 1:
+                    self.ctx.logger.info(
+                        "[SetuPlugin] 第 %d 次重试下载成功: %s", attempt, target
+                    )
+                return data
+            if attempt < DOWNLOAD_MAX_ATTEMPTS:
+                self.ctx.logger.warning(
+                    "[SetuPlugin] 下载失败，重建连接后重试 (%d/%d): %s",
+                    attempt,
+                    DOWNLOAD_MAX_ATTEMPTS - 1,
+                    target,
+                )
+                await self._reset_http_session()
+                await asyncio.sleep(1.0 * attempt)
+
+        self.ctx.logger.error(
+            "[SetuPlugin] 下载失败（已尝试 %d 次）: %s", DOWNLOAD_MAX_ATTEMPTS, url
+        )
+        return None
 
     async def _send_setu_images(self, setu_list, stream_id, group_id="", user_id=""):
         sent_count = 0
@@ -412,18 +492,17 @@ class SetuPlugin(MaiBotPlugin):
             # 图片模式 / kz_link 模式的全年龄部分 / both 模式
             b64_data = await self._download_image_as_base64(image_url)
             if not b64_data:
-                # 图片下载失败时回退到发链接
-                if send_mode in ("both", "两者"):
-                    try:
-                        msg_id = await self._send_text_via_api(title + " - " + author + "\n" + image_url, stream_id, group_id, user_id)
-                        sent_count += 1
-                        recall_sec = self.config.limits.recall_after_seconds
-                        if recall_sec > 0 and msg_id:
-                            asyncio.create_task(self._schedule_recall(stream_id, recall_sec, msg_id))
-                    except Exception as e:
-                        info_lines.append("• " + r18_flag + title + " - 发送失败: " + str(e))
-                else:
-                    info_lines.append("• " + r18_flag + title + " - " + author + " - 图片下载失败")
+                # 下载失败时一律回退发链接：至少让用户拿到图，而不是什么都没有
+                link_text = title + " - " + author + "\n" + image_url
+                try:
+                    msg_id = await self._send_text_via_api(link_text, stream_id, group_id, user_id)
+                    sent_count += 1
+                    info_lines.append("• " + r18_flag + title + " - 图片下载超时，已改发链接")
+                    recall_sec = self.config.limits.recall_after_seconds
+                    if recall_sec > 0 and msg_id:
+                        asyncio.create_task(self._schedule_recall(stream_id, recall_sec, msg_id))
+                except Exception as e:
+                    info_lines.append("• " + r18_flag + title + " - 发送失败: " + str(e))
                 continue
 
             try:
@@ -446,7 +525,33 @@ class SetuPlugin(MaiBotPlugin):
                 except Exception:
                     pass
 
+        if sent_count == 0 and info_lines:
+            # 一张都没发出去，补一句提示，避免用户那边“图来了”之后永久静默
+            try:
+                await self._send_text_via_api(
+                    "这组图没取到：" + info_lines[0].lstrip("• ").strip(),
+                    stream_id,
+                    group_id,
+                    user_id,
+                )
+            except Exception:
+                pass
+
         return sent_count, info_lines
+
+    @staticmethod
+    def _is_send_failure(result: Dict[str, Any]) -> bool:
+        """判断适配器返回的是不是失败结果。
+
+        新版适配器失败时返回 ``{'success': False, 'error': ...}`` 而**不抛异常**，
+        旧版 NapCat 风格返回 ``{'status': 'failed', 'retcode': ...}``，两种都要认。
+        """
+        if result.get("success") is False:
+            return True
+        if str(result.get("status") or "").lower() in ("failed", "error"):
+            return True
+        retcode = result.get("retcode")
+        return isinstance(retcode, int) and retcode != 0
 
     async def _send_image_via_api(self, b64_data, stream_id, group_id="", user_id=""):
         """通过 NapCat send_msg API 发送图片，返回 message_id"""
@@ -482,10 +587,28 @@ class SetuPlugin(MaiBotPlugin):
                 params=send_params,
             )
             self.ctx.logger.info("[SetuPlugin] send_msg API 返回: %s", result)
-            if isinstance(result, dict) and not result.get("success", True):
-                self.ctx.logger.warning("[SetuPlugin] send_msg API 失败，回退到 ctx.send.image")
+            if isinstance(result, dict) and self._is_send_failure(result):
+                error_text = str(
+                    result.get("error")
+                    or result.get("wording")
+                    or result.get("message")
+                    or result
+                )
+                if "NTEvent" in error_text or "Timeout" in error_text:
+                    # NapCat 的经典情况：图已经发出去了，只是等不到 kernel 的发送回执。
+                    # 这时绝不能重发，否则群里会出现两张一样的图。
+                    self.ctx.logger.warning(
+                        "[SetuPlugin] send_msg 回执超时，消息可能已送达，跳过重复发送: %s",
+                        error_text[:200],
+                    )
+                    return None
+                self.ctx.logger.warning(
+                    "[SetuPlugin] send_msg 发送失败，回退到 ctx.send.image: %s",
+                    error_text[:200],
+                )
                 await self.ctx.send.image(b64_data, stream_id)
                 return None
+            # 提取 message_id — 从 data 嵌套层提取
             if isinstance(result, dict):
                 msg_id = result.get("message_id")
                 if not msg_id and isinstance(result.get("data"), dict):
@@ -533,10 +656,22 @@ class SetuPlugin(MaiBotPlugin):
                 params=send_params,
             )
             self.ctx.logger.info("[SetuPlugin] send_text API 返回: %s", result)
-            if isinstance(result, dict) and not result.get("success", True):
-                self.ctx.logger.warning("[SetuPlugin] send_text API 失败，回退到 ctx.send.text")
-                await self.ctx.send.text(text, stream_id)
-                return None
+            if isinstance(result, dict) and self._is_send_failure(result):
+                error_text = str(
+                    result.get("error")
+                    or result.get("wording")
+                    or result.get("message")
+                    or result
+                )
+                if "NTEvent" in error_text or "Timeout" in error_text:
+                    self.ctx.logger.warning(
+                        "[SetuPlugin] send_text 回执超时，消息可能已送达: %s",
+                        error_text[:200],
+                    )
+                    return None
+                self.ctx.logger.warning("[SetuPlugin] send_text 发送失败: %s", error_text[:200])
+                raise RuntimeError("发送文本失败: " + error_text[:200])
+            # 提取 message_id
             if isinstance(result, dict):
                 msg_id = result.get("message_id")
                 if not msg_id and isinstance(result.get("data"), dict):
@@ -663,15 +798,40 @@ class SetuPlugin(MaiBotPlugin):
             ai_type = {0: "未知", 1: "非AI", 2: "AI作品"}.get(item.get("aiType", 0), "未知")
             detail_parts.append("《" + title + "》作者:" + author + " PID:" + str(pid) + " R18:" + is_r18 + " AI:" + ai_type + " 标签:[" + tags_str + "]")
 
-        # 异步发送图片（不等待完成）
-        asyncio.create_task(self._send_setu_images(
+        # 等待发送结果再返回，让工具结果能如实告诉模型有没有发出去。
+        # 宿主对工具调用的 RPC 上限是 60 秒，所以最多等 SEND_REPORT_WAIT_SEC；
+        # 超时不取消后台任务（它继续发），本次只返回“尚未确认”。
+        send_task = asyncio.create_task(self._send_setu_images(
             setu_list, stream_id,
             group_id=str(kwargs.get("group_id", "")),
             user_id=str(kwargs.get("user_id", "")),
         ))
+        self._pending_send_tasks.add(send_task)
+        send_task.add_done_callback(self._pending_send_tasks.discard)
 
-        summary = "图片正在发送给用户（共 " + str(len(setu_list)) + " 张）。"
+        sent_count: Optional[int] = None
+        info_lines: List[str] = []
+        done, _ = await asyncio.wait({send_task}, timeout=SEND_REPORT_WAIT_SEC)
+        if send_task in done:
+            try:
+                sent_count, info_lines = send_task.result()
+            except Exception as e:
+                self.ctx.logger.error("[SetuPlugin] 发送任务异常: %s", e)
+                sent_count, info_lines = 0, ["• 发送任务异常: " + str(e)]
+
+        if sent_count is None:
+            summary = "图片仍在发送中（共 " + str(len(setu_list)) + " 张），本次未能确认结果。"
+        elif info_lines:
+            summary = (
+                "本次共 " + str(len(setu_list)) + " 张，实际发送出 " + str(sent_count) + " 条，"
+                "存在降级或失败：\n" + "\n".join(info_lines)
+            )
+        elif sent_count:
+            summary = "图片已发送（共 " + str(sent_count) + " 张）。"
+        else:
+            summary = "图片没有发送成功（共 " + str(len(setu_list)) + " 张）。"
         summary += "\n图片信息:\n" + "\n".join(detail_parts)
+        self.ctx.logger.info("[SetuPlugin] get_setu 返回: %s", summary.replace("\n", " | "))
         return {"name": "get_setu", "content": summary}
 
     # ── 2. Tool: enable_r18 ────────────────────────────────
@@ -812,12 +972,14 @@ class SetuPlugin(MaiBotPlugin):
                 return False, result["error"], True
 
             setu_list = result["data"]
-            sent_count, _ = await self._send_setu_images(
+            sent_count, info_lines = await self._send_setu_images(
                 setu_list, stream_id,
                 group_id=str(kwargs.get("group_id", "")),
                 user_id=str(kwargs.get("user_id", "")),
             )
 
+            if info_lines:
+                return True, "已发送 " + str(sent_count) + " 条，存在降级/失败: " + "；".join(info_lines), True
             return True, "已发送 " + str(sent_count) + " 张图片", True
         except Exception as e:
             self.ctx.logger.error("[SetuPlugin] /setu 命令异常: %s", e, exc_info=True)
